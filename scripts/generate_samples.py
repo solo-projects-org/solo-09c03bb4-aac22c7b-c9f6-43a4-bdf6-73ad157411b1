@@ -92,7 +92,8 @@ def write_checkpoint(log_dir: Path, version: int,
     pq.write_table(table, log_dir / checkpoint_name(version))
 
 
-def write_manifest(table_dir: Path, existing: list[str]) -> None:
+def write_manifest(table_dir: Path, existing: list[str],
+                   create_placeholders: bool = True) -> None:
     lines = ["# 现存数据文件表内相对路径清单（# 开头为注释，空行忽略）"]
     for i, p in enumerate(existing):
         # 故意混入 ./ 前缀与空行，验证服务端归一化逻辑
@@ -101,6 +102,8 @@ def write_manifest(table_dir: Path, existing: list[str]) -> None:
             lines.append("")
     (table_dir / "existing_files.txt").write_text(
         "\n".join(lines) + "\n", encoding="utf-8")
+    if not create_placeholders:
+        return
     # 同步建占位文件，让 samples 目录看起来像真实表布局
     for p in existing:
         target = table_dir / p
@@ -171,9 +174,48 @@ def build_incident() -> None:
     write_manifest(table_dir, [a(0), a(1), a(2), a(3), a(5)])
 
 
+def build_large() -> None:
+    """大表：30 个版本共享上万份数据文件，用于验证首屏计数与分页明细。
+
+    v0 一次引入 8000 个文件，之后每版新增 150 个；v15 留有检查点。
+    现存清单故意漏掉约 40 个文件（按固定间隔），因此各版会显示不同的
+    “缺失数”，而点开任一已重建版本后可以按路径顺序分页查看现存状态。
+    """
+    table_dir = SAMPLES / "large_table"
+    reset_dir(table_dir)
+    log_dir = table_dir / "_delta_log"
+    log_dir.mkdir(parents=True)
+
+    f = lambda n: f"data/part-{n:05d}-shared.parquet"
+    base_files = 8000
+    add_per_version = 150
+    n_versions = 30
+
+    total_files = base_files + (n_versions - 1) * add_per_version
+    active = [f(i) for i in range(base_files)]
+    write_commit(log_dir, 0, [PROTOCOL_ACTION] + [add_action(p) for p in active])
+
+    for version in range(1, n_versions):
+        start = base_files + (version - 1) * add_per_version
+        new_paths = [f(i) for i in range(start, start + add_per_version)]
+        write_commit(log_dir, version, [add_action(p) for p in new_paths])
+        active.extend(new_paths)
+        if version == 15:
+            write_checkpoint(log_dir, version, active, [])
+
+    (log_dir / "_last_checkpoint").write_text(json.dumps({
+        "version": 15, "size": 0}), encoding="utf-8")
+
+    # 模拟部分 Parquet 在事故中丢失；其余上万份文件才进入现存清单。
+    missing = {f(i) for i in range(total_files) if i % 300 == 250}
+    existing = [p for p in (f(i) for i in range(total_files)) if p not in missing]
+    write_manifest(table_dir, existing, create_placeholders=False)
+
+
 def main() -> None:
     build_healthy()
     build_incident()
+    build_large()
     print(f"样例已生成于 {SAMPLES}")
     for table in sorted(SAMPLES.iterdir()):
         if table.is_dir():

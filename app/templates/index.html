@@ -64,6 +64,21 @@
     .ignored strong { color: #9a6a1c; }
     details { margin-top: 8px; }
     summary { cursor: pointer; font-size: 12px; color: var(--blue); }
+    .btn-detail { background: #eef2ff; color: #2b4acb; border: 1px solid #c7d2fe;
+                  font-size: 12px; padding: 5px 10px; margin-top: 7px; }
+    .btn-detail:disabled { background: #f3f4f6; color: #9ca3af; cursor: wait; }
+    .detail-panel { margin-top: 9px; padding: 10px 12px; border: 1px solid var(--line);
+                    border-radius: 8px; background: #fafbfd; }
+    .detail-panel .pager { display: flex; align-items: center; gap: 9px;
+                           flex-wrap: wrap; margin-bottom: 7px; }
+    .pager button { background: #fff; color: #334155; border: 1px solid var(--line);
+                    padding: 4px 11px; font-size: 12px; }
+    .pager button:disabled { color: #b6bec9; cursor: default; }
+    .pager .pageinfo { font-size: 12px; color: var(--muted);
+                       font-family: ui-monospace, monospace; }
+    .detail-note { font-size: 12px; color: var(--muted); }
+    .detail-note.missing { color: var(--red-fg); font-weight: 600; }
+
   </style>
 </head>
 <body>
@@ -128,6 +143,9 @@
       missing_commit: "缺失提交，重放中断",
       missing_files: "重放完整但缺数据文件"
     };
+    const DETAIL_PAGE_SIZE = 200;
+    // 每次重新渲染报告就递增；异步明细请求返回时据此丢弃旧报告的响应。
+    let reportGeneration = 0;
 
     function esc(s) {
       return String(s).replace(/[&<>"']/g, c =>
@@ -141,13 +159,24 @@
     }
 
     function renderReport(r) {
+      reportGeneration += 1;
+      const gen = reportGeneration;
       const s = r.summary;
       const rows = r.versions.map(v => {
-        const files = v.referenced_files.map(p => {
-          const miss = v.missing_files.includes(p);
-          return '<li class="' + (miss ? 'missing' : 'ok') + '">' +
-            (miss ? '✗ 缺失 ' : '✓ ') + esc(p) + '</li>';
-        }).join('');
+        // 首屏只带结论与计数；文件路径明细不预生成，点开后才向分页接口取。
+        const detailCell =
+          '<div class="kv">快照引用 <strong>' + v.referenced_file_count +
+            '</strong> 个文件，缺失 <strong' +
+            (v.missing_file_count ? ' style="color:var(--red-fg)"' : '') + '>' +
+            v.missing_file_count + '</strong> 个</div>' +
+          (v.replay_complete
+            ? '<button type="button" class="btn-detail" data-analysis="' +
+                esc(r.analysis_id || '') + '" data-version="' + v.version +
+                '" data-gen="' + gen + '">查看文件明细（' +
+                v.referenced_file_count + '）</button>' +
+              '<div class="detail-panel" id="detail-' + esc(r.analysis_id || '') +
+                '-' + v.version + '" hidden></div>'
+            : '<div class="detail-note">重放中断，无完整快照可展开</div>');
         return '<tr>' +
           '<td class="ver">v' + v.version + '</td>' +
           '<td><span class="badge badge-' + v.status + '">' + STATUS_TEXT[v.status] + '</span></td>' +
@@ -157,10 +186,7 @@
               ? '<span class="miss-commits">缺提交号：' +
                 v.missing_commits.map(c => 'v' + c).join(', ') + '</span>'
               : '<span class="kv">连续无断档</span>') + '</td>' +
-          '<td><div class="kv">快照引用 ' + v.referenced_file_count + ' 个文件，' +
-            '缺失 ' + v.missing_files.length + ' 个</div>' +
-            (files ? '<details><summary>查看文件核对明细</summary><ul class="filelist">' +
-              files + '</ul></details>' : '') + '</td>' +
+          '<td>' + detailCell + '</td>' +
           '</tr>';
       }).join('');
 
@@ -190,10 +216,94 @@
         (ignored ? '<div style="margin-top:8px">' + ignored + '</div>' : '') +
       '</section>' +
       '<section class="card"><h2>逐版重放与文件核对</h2>' +
+        '<div class="detail-note" style="margin-bottom:8px">' +
+          '首屏仅列出逐版结论与文件计数；点开已重建的版本后，文件明细按路径排序、' +
+          '每页最多 200 条按需加载，翻页无需重新上传材料。</div>' +
         '<table><thead><tr><th>版本</th><th>结论</th><th>重放起点</th>' +
         '<th>缺失提交</th><th>快照引用文件核对</th></tr></thead><tbody>' +
         rows + '</tbody></table></section>';
     }
+
+    function renderDetailPage(panel, d, gen) {
+      const items = d.files.map(f => {
+        return '<li class="' + (f.exists ? 'ok' : 'missing') + '">' +
+          (f.exists ? '✓ 现存 ' : '✗ 缺失 ') + esc(f.path) + '</li>';
+      }).join('');
+      const totalPages = Math.max(d.total_pages, 1);
+      panel.hidden = false;
+      panel.innerHTML =
+        '<div class="pager">' +
+          '<button type="button" class="page-btn" data-analysis="' + esc(d.analysis_id) +
+            '" data-version="' + d.version + '" data-gen="' + gen +
+            '" data-page="' + (d.page - 1) + '"' + (d.has_previous ? '' : ' disabled') +
+            '>上一页</button>' +
+          '<span class="pageinfo">第 ' + d.page + ' / ' + totalPages +
+            ' 页 · 共 ' + d.total + ' 个文件 · 缺失 ' + d.missing_file_count + ' 个</span>' +
+          '<button type="button" class="page-btn" data-analysis="' + esc(d.analysis_id) +
+            '" data-version="' + d.version + '" data-gen="' + gen +
+            '" data-page="' + (d.page + 1) + '"' + (d.has_next ? '' : ' disabled') +
+            '>下一页</button>' +
+        '</div>' +
+        '<div class="detail-note' + (d.missing_file_count ? ' missing' : '') + '">' +
+          '文件按路径排序，每页最多 200 条；✓ 表示现存，✗ 表示缺失。</div>' +
+        (items ? '<ul class="filelist">' + items + '</ul>'
+               : '<div class="detail-note">本页没有文件。</div>');
+    }
+
+    async function loadDetailPage(trigger, page) {
+      const analysisId = trigger.dataset.analysis;
+      const version = Number(trigger.dataset.version);
+      const gen = Number(trigger.dataset.gen);
+      const panel = document.getElementById('detail-' + analysisId + '-' + version);
+      // 新报告已渲染：旧报告留下的按钮 / 请求一律作废。
+      if (!panel || gen !== reportGeneration || !analysisId) return;
+
+      const isMainButton = trigger.classList.contains('btn-detail');
+      if (isMainButton) {
+        trigger.disabled = true;
+        trigger.dataset.originalLabel = trigger.textContent;
+        trigger.textContent = '加载中…';
+      } else {
+        trigger.disabled = true;
+      }
+      try {
+        const resp = await fetch('/api/analyses/' + encodeURIComponent(analysisId) +
+          '/versions/' + version + '/files?page=' + page +
+          '&page_size=' + DETAIL_PAGE_SIZE);
+        const data = await resp.json();
+        if (gen !== reportGeneration || !panel.isConnected) return;
+        if (!resp.ok) {
+          panel.hidden = false;
+          panel.innerHTML = '<div class="error">❌ ' + esc(data.error || '加载文件明细失败') + '</div>';
+          return;
+        }
+        renderDetailPage(panel, data, gen);
+      } catch (e) {
+        if (gen === reportGeneration && panel.isConnected) {
+          panel.hidden = false;
+          panel.innerHTML = '<div class="error">❌ 请求文件明细失败：' + esc(e) + '</div>';
+        }
+      } finally {
+        if (isMainButton && gen === reportGeneration) {
+          trigger.disabled = false;
+          trigger.textContent = trigger.dataset.originalLabel;
+        }
+      }
+    }
+
+    document.addEventListener('click', ev => {
+      const detailBtn = ev.target.closest('.btn-detail');
+      if (detailBtn) {
+        ev.preventDefault();
+        loadDetailPage(detailBtn, 1);
+        return;
+      }
+      const pageBtn = ev.target.closest('.page-btn');
+      if (pageBtn) {
+        ev.preventDefault();
+        loadDetailPage(pageBtn, Number(pageBtn.dataset.page));
+      }
+    });
 
     function showError(msg) {
       document.getElementById('report-root').innerHTML =

@@ -363,17 +363,13 @@ def _replay(target: int,
     }
 
 
-def analyze(log_files: list[InputFile],
-            manifest_files: list[InputFile],
-            from_version: int,
-            to_version: int) -> dict[str, Any]:
-    """分析入口：逐版重放并核对现存数据文件。"""
-    if not isinstance(from_version, int) or not isinstance(to_version, int):
-        raise AnalyzerError("版本号必须是整数")
-    if from_version < 0 or to_version < 0:
-        raise AnalyzerError("版本号不能为负数")
-    if from_version > to_version:
-        raise AnalyzerError("版本区间起点不能大于终点")
+def _build_context(log_files: list[InputFile],
+                   manifest_files: list[InputFile]):
+    """解析并校验一次分析所需的全部输入。
+
+    API 首屏只调用一次拿到逐版计数；分页接口可用同一批已持久化的输入
+    重新构建上下文，因此不依赖任何进程内状态。
+    """
     if not log_files:
         raise AnalyzerError("请至少上传一个 _delta_log 中的 JSON 提交或 Parquet 检查点")
 
@@ -392,6 +388,28 @@ def analyze(log_files: list[InputFile],
         manifest_names.append(item.filename.rsplit("/", 1)[-1])
         existing |= parse_manifest(item.data, item.filename)
 
+    return commits, checkpoints, ignored, duplicate, existing, manifest_names
+
+
+def analyze(log_files: list[InputFile],
+            manifest_files: list[InputFile],
+            from_version: int,
+            to_version: int) -> dict[str, Any]:
+    """分析入口：逐版重放并核对现存数据文件。
+
+    返回的逐版结果只包含结论与计数，**不包含**任何文件路径明细；明细由
+    :func:`build_version_detail` 在用户点开某一版本时按需生成并分页。
+    """
+    if not isinstance(from_version, int) or not isinstance(to_version, int):
+        raise AnalyzerError("版本号必须是整数")
+    if from_version < 0 or to_version < 0:
+        raise AnalyzerError("版本号不能为负数")
+    if from_version > to_version:
+        raise AnalyzerError("版本区间起点不能大于终点")
+
+    commits, checkpoints, ignored, duplicate, existing, manifest_names = \
+        _build_context(log_files, manifest_files)
+
     version_reports = []
     summary = {STATUS_RECOVERABLE: 0,
                STATUS_MISSING_COMMIT: 0,
@@ -399,13 +417,14 @@ def analyze(log_files: list[InputFile],
 
     for target in range(from_version, to_version + 1):
         result = _replay(target, commits, checkpoints)
-        active: dict[str, dict] = result["active"]
-        referenced = sorted(active.keys())
-        missing_files = sorted(p for p in referenced if p not in existing)
+        active = result["active"]
+        # 只算计数，不排序、不把上万个路径装进首屏响应。
+        missing_count = sum(1 for p in active if p not in existing)
+        referenced_count = len(active)
 
         if result["missing_commits"]:
             status = STATUS_MISSING_COMMIT
-        elif missing_files:
+        elif missing_count:
             status = STATUS_MISSING_FILES
         else:
             status = STATUS_RECOVERABLE
@@ -416,9 +435,8 @@ def analyze(log_files: list[InputFile],
             "status": status,
             "replay_complete": result["replay_complete"],
             "base": result["base"],
-            "referenced_files": referenced,
-            "referenced_file_count": len(referenced),
-            "missing_files": missing_files,
+            "referenced_file_count": referenced_count,
+            "missing_file_count": missing_count,
             "missing_commits": result["missing_commits"],
             "note": result["note"],
         })
@@ -434,4 +452,39 @@ def analyze(log_files: list[InputFile],
         "existing_file_count": len(existing),
         "summary": summary,
         "versions": version_reports,
+    }
+
+
+def build_version_detail(log_files: list[InputFile],
+                         manifest_files: list[InputFile],
+                         version: int) -> dict[str, Any]:
+    """按需重建单个版本的文件快照（按路径排序，附现存状态）。
+
+    这是分页接口的数据源：调用方从持久化存储取回原核查的日志与清单，
+    因此即使请求落到另一个服务进程也能得到与原核查一致的结果。
+    """
+    if not isinstance(version, int):
+        raise AnalyzerError("版本号必须是整数")
+    if version < 0:
+        raise AnalyzerError("版本号不能为负数")
+
+    commits, checkpoints, _ignored, _duplicate, existing, _manifests = \
+        _build_context(log_files, manifest_files)
+
+    result = _replay(version, commits, checkpoints)
+    referenced = sorted(result["active"].keys())
+    files = [{"path": path, "exists": path in existing} for path in referenced]
+
+    return {
+        "version": version,
+        "status": (STATUS_MISSING_COMMIT if result["missing_commits"]
+                   else (STATUS_MISSING_FILES
+                         if any(not f["exists"] for f in files)
+                         else STATUS_RECOVERABLE)),
+        "replay_complete": result["replay_complete"],
+        "base": result["base"],
+        "missing_commits": result["missing_commits"],
+        "referenced_file_count": len(files),
+        "missing_file_count": sum(1 for f in files if not f["exists"]),
+        "files": files,
     }

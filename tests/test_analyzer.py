@@ -20,6 +20,7 @@ from app.analyzer import (
     STATUS_MISSING_FILES,
     STATUS_RECOVERABLE,
     analyze,
+    build_version_detail,
     normalize_data_path,
     parse_checkpoint,
     parse_commit,
@@ -139,14 +140,22 @@ def test_bad_parquet_rejected():
 # ---------- 完整分析：仅提交 ----------
 
 def test_replay_commits_only_all_recoverable():
-    report = analyze(basic_commits(), [manifest([f(i) for i in range(5)])], 0, 3)
+    logs = basic_commits()
+    manifest_files = [manifest([f(i) for i in range(5)])]
+    report = analyze(logs, manifest_files, 0, 3)
     statuses = {v["version"]: v["status"] for v in report["versions"]}
     assert statuses == {0: STATUS_RECOVERABLE, 1: STATUS_RECOVERABLE,
                         2: STATUS_RECOVERABLE, 3: STATUS_RECOVERABLE}
     v3 = report["versions"][3]
-    assert v3["referenced_files"] == sorted([f(2), f(3), f(4)])
+    # 首屏只给计数，不携带路径明细
+    assert v3["referenced_file_count"] == 3
+    assert v3["missing_file_count"] == 0
+    assert "referenced_files" not in v3
+    assert "missing_files" not in v3
+    detail = build_version_detail(logs, manifest_files, 3)
+    assert [item["path"] for item in detail["files"]] == sorted([f(2), f(3), f(4)])
+    assert all(item["exists"] for item in detail["files"])
     assert v3["base"] == "commit-0"
-    assert v3["missing_files"] == []
     assert report["summary"][STATUS_RECOVERABLE] == 4
 
 
@@ -156,18 +165,24 @@ def test_remove_then_readd_same_path():
         commit_file(1, [remove(f(0))]),
         commit_file(2, [add(f(0))]),
     ]
-    report = analyze(commits, [manifest([f(0)])], 2, 2)
+    manifest_files = [manifest([f(0)])]
+    report = analyze(commits, manifest_files, 2, 2)
     v2 = report["versions"][0]
     assert v2["status"] == STATUS_RECOVERABLE
-    assert v2["referenced_files"] == [f(0)]
+    detail = build_version_detail(commits, manifest_files, 2)
+    assert [item["path"] for item in detail["files"]] == [f(0)]
 
 
 def test_missing_data_file_flagged_with_path():
-    report = analyze(basic_commits(), [manifest([f(0), f(1), f(2), f(3)])], 3, 3)
+    manifest_files = [manifest([f(0), f(1), f(2), f(3)])]
+    report = analyze(basic_commits(), manifest_files, 3, 3)
     v3 = report["versions"][0]
     assert v3["status"] == STATUS_MISSING_FILES
-    assert v3["missing_files"] == [f(4)]
+    assert v3["missing_file_count"] == 1
     assert v3["missing_commits"] == []
+    detail = build_version_detail(basic_commits(), manifest_files, 3)
+    missing = [item["path"] for item in detail["files"] if not item["exists"]]
+    assert missing == [f(4)]
 
 
 def test_missing_commit_breaks_replay_and_lists_version():
@@ -198,20 +213,26 @@ def test_checkpoint_base_short_circuits_missing_early_commits():
     # 只有 v2 检查点 + v3 提交；v0/v1 提交缺失，但检查点不晚于目标版本
     logs = [checkpoint_file(2, [f(0), f(2), f(3)]),
             commit_file(3, [add(f(4)), remove(f(0))])]
-    report = analyze(logs, [manifest([f(0), f(2), f(3), f(4)])], 2, 3)
+    manifest_files = [manifest([f(0), f(2), f(3), f(4)])]
+    report = analyze(logs, manifest_files, 2, 3)
     v2, v3 = report["versions"]
     assert v2["status"] == STATUS_RECOVERABLE
     assert v2["base"] == "checkpoint-2"
     assert v3["base"] == "checkpoint-2"
-    assert v3["referenced_files"] == sorted([f(2), f(3), f(4)])
+    detail = build_version_detail(logs, manifest_files, 3)
+    assert [item["path"] for item in detail["files"]] == sorted([f(2), f(3), f(4)])
 
 
 def test_checkpoint_tombstones_not_part_of_snapshot():
     ck = checkpoint_file(1, [f(0)], tombstones=[f(9)])
-    report = analyze([ck], [manifest([f(0)])], 1, 1)
+    manifest_files = [manifest([f(0)])]
+    report = analyze([ck], manifest_files, 1, 1)
     v1 = report["versions"][0]
-    assert v1["referenced_files"] == [f(0)]
-    assert f(9) not in v1["referenced_files"]
+    detail = build_version_detail([ck], manifest_files, 1)
+    paths = [item["path"] for item in detail["files"]]
+    assert paths == [f(0)]
+    assert f(9) not in paths
+    assert v1["referenced_file_count"] == 1
 
 
 def test_checkpoint_older_than_target_requires_continuous_commits():
@@ -307,5 +328,9 @@ def test_no_manifest_means_every_referenced_file_is_missing():
     report = analyze(basic_commits(), [], 2, 2)
     v2 = report["versions"][0]
     assert v2["status"] == STATUS_MISSING_FILES
-    assert v2["missing_files"] == sorted([f(0), f(2), f(3)])
+    assert v2["referenced_file_count"] == 3
+    assert v2["missing_file_count"] == 3
     assert report["existing_file_count"] == 0
+    detail = build_version_detail(basic_commits(), [], 2)
+    assert [item["path"] for item in detail["files"]] == sorted([f(0), f(2), f(3)])
+    assert all(item["exists"] is False for item in detail["files"])

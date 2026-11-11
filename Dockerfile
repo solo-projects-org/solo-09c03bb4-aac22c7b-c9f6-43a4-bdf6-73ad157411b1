@@ -2,7 +2,9 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    ANALYSIS_DB_PATH=/srv/state/analyses.sqlite3 \
+    SAMPLE_ROOT=/srv/samples
 
 WORKDIR /srv
 
@@ -14,7 +16,7 @@ COPY scripts ./scripts
 COPY samples ./samples
 
 # 容器启动前确保内置样例就绪（仓库已带样例，此步为幂等保险）
-RUN python -I scripts/generate_samples.py
+RUN python -I scripts/generate_samples.py && mkdir -p /srv/state
 
 EXPOSE 8000
 
